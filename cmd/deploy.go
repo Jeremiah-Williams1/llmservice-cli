@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 
 	"jerremiah.dev/llmservice-cli/internal/k8s"
 	"jerremiah.dev/llmservice-cli/internal/llmservice"
@@ -41,7 +42,7 @@ var deployCmd = &cobra.Command{
 		ctx := context.Background()
 		resourceClient := dynClient.Resource(k8s.LLMServiceGVR).Namespace(namespace)
 
-		existing, err := resourceClient.Get(ctx, name, metav1.GetOptions{})
+		_, err := resourceClient.Get(ctx, name, metav1.GetOptions{})
 		if apierrors.IsNotFound(err) {
 			// First deploy for this name - nothing to snapshot for rollback.
 			obj := llmservice.ToUnstructured(name, namespace, spec)
@@ -57,24 +58,39 @@ var deployCmd = &cobra.Command{
 
 		// Already exists - snapshot its current spec into the new object's
 		// annotation before overwriting, so rollback has something to
-		// revert to. Update (not Create) requires the current
-		// resourceVersion, or the API server rejects it as a conflict.
-		previousSpec, _, err := llmservice.FromUnstructured(existing)
-		if err != nil {
-			return fmt.Errorf("reading current spec of %s before update: %w", name, err)
-		}
-		previousSpecJSON, err := json.Marshal(previousSpec)
-		if err != nil {
-			return fmt.Errorf("encoding previous spec for rollback annotation: %w", err)
-		}
+		// revert to. Wrapped in RetryOnConflict: if something else (the
+		// reconciler, another deploy) writes to this object between our
+		// Get and our Update, the API server rejects our stale
+		// resourceVersion with a 409 - RetryOnConflict catches that
+		// specific error, re-runs the whole Get-modify-Update cycle with
+		// the now-current resourceVersion, and only gives up after
+		// DefaultBackoff is exhausted (a handful of quick retries, not
+		// an infinite loop).
+		err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			existing, err := resourceClient.Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
 
-		obj := llmservice.ToUnstructured(name, namespace, spec)
-		obj.SetResourceVersion(existing.GetResourceVersion())
-		obj.SetAnnotations(map[string]string{
-			previousSpecAnnotation: string(previousSpecJSON),
+			previousSpec, _, err := llmservice.FromUnstructured(existing)
+			if err != nil {
+				return fmt.Errorf("reading current spec of %s before update: %w", name, err)
+			}
+			previousSpecJSON, err := json.Marshal(previousSpec)
+			if err != nil {
+				return fmt.Errorf("encoding previous spec for rollback annotation: %w", err)
+			}
+
+			obj := llmservice.ToUnstructured(name, namespace, spec)
+			obj.SetResourceVersion(existing.GetResourceVersion())
+			obj.SetAnnotations(map[string]string{
+				previousSpecAnnotation: string(previousSpecJSON),
+			})
+
+			_, err = resourceClient.Update(ctx, obj, metav1.UpdateOptions{})
+			return err
 		})
-
-		if _, err := resourceClient.Update(ctx, obj, metav1.UpdateOptions{}); err != nil {
+		if err != nil {
 			return fmt.Errorf("updating %s: %w", name, err)
 		}
 		fmt.Printf("updated %s (previous spec saved for rollback)\n", name)

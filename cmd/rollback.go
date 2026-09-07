@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 
 	"jerremiah.dev/llmservice-cli/internal/k8s"
 	"jerremiah.dev/llmservice-cli/internal/llmservice"
@@ -51,18 +52,26 @@ var rollbackCmd = &cobra.Command{
 			return fmt.Errorf("decoding stored previous spec for %s: %w", name, err)
 		}
 
-		obj := llmservice.ToUnstructured(name, namespace, previousSpec)
-		obj.SetResourceVersion(existing.GetResourceVersion())
-		// Clear the annotation on rollback rather than carrying it forward -
-		// this is one level of undo, not a redo stack. Leaving the old
-		// annotation in place would make a second `rollback` silently
-		// re-apply the same spec again, which would look like a no-op bug
-		// rather than the "nothing left to roll back to" error it should be.
-		obj.SetAnnotations(map[string]string{
-			previousSpecAnnotation: "",
-		})
+		// Same conflict-retry reasoning as deploy.go: re-fetch and rebuild
+		// on each attempt so the resourceVersion sent is always current.
+		err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+			latest, err := resourceClient.Get(ctx, name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
 
-		if _, err := resourceClient.Update(ctx, obj, metav1.UpdateOptions{}); err != nil {
+			obj := llmservice.ToUnstructured(name, namespace, previousSpec)
+			obj.SetResourceVersion(latest.GetResourceVersion())
+			// Clear the annotation on rollback rather than carrying it
+			// forward - this is one level of undo, not a redo stack.
+			obj.SetAnnotations(map[string]string{
+				previousSpecAnnotation: "",
+			})
+
+			_, err = resourceClient.Update(ctx, obj, metav1.UpdateOptions{})
+			return err
+		})
+		if err != nil {
 			return fmt.Errorf("rolling back %s: %w", name, err)
 		}
 		fmt.Printf("rolled back %s\n", name)
