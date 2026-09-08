@@ -76,12 +76,19 @@ var deployCmd = &cobra.Command{
 			if err != nil {
 				return fmt.Errorf("reading current spec of %s before update: %w", name, err)
 			}
+
+			// 1. Start with the existing spec as the base
+			newSpec := previousSpec
+
+			// 2. Mutate ONLY the fields explicitly set in flags
+			applyFlagsToSpec(cmd, &newSpec)
+
 			previousSpecJSON, err := json.Marshal(previousSpec)
 			if err != nil {
 				return fmt.Errorf("encoding previous spec for rollback annotation: %w", err)
 			}
 
-			obj := llmservice.ToUnstructured(name, namespace, spec)
+			obj := llmservice.ToUnstructured(name, namespace, newSpec)
 			obj.SetResourceVersion(existing.GetResourceVersion())
 			obj.SetAnnotations(map[string]string{
 				previousSpecAnnotation: string(previousSpecJSON),
@@ -130,6 +137,40 @@ func buildSpecFromFlags(cmd *cobra.Command) llmservice.Spec {
 	}
 
 	return spec
+}
+
+func applyFlagsToSpec(cmd *cobra.Command, spec *llmservice.Spec) {
+	if cmd.Flags().Changed("model") {
+		spec.Model = flagModel
+	}
+	if cmd.Flags().Changed("image") {
+		spec.Image = flagImage
+	}
+	if cmd.Flags().Changed("cpu-request") {
+		spec.CPURequest = flagCPURequest
+	}
+	if cmd.Flags().Changed("memory-request") {
+		spec.MemoryRequest = flagMemoryRequest
+	}
+	if cmd.Flags().Changed("port") {
+		spec.Port = flagPort
+	}
+	if cmd.Flags().Changed("replicas") {
+		v := flagReplicas
+		spec.Replicas = &v
+	}
+	if cmd.Flags().Changed("gpu-count") {
+		v := flagGPUCount
+		spec.GPUCount = &v
+	}
+	if cmd.Flags().Changed("autoscaling-min") {
+		v := flagAutoscalingMin
+		spec.AutoscalingMin = &v
+	}
+	if cmd.Flags().Changed("autoscaling-max") {
+		v := flagAutoscalingMax
+		spec.AutoscalingMax = &v
+	}
 }
 
 func init() {
